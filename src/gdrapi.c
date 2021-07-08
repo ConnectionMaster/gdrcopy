@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2014-2021, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -46,15 +46,6 @@
 #include "gdrapi.h"
 #include "gdrdrv.h"
 #include "gdrapi_internal.h"
-
-// TODO either use page_size = sysconf(_SC_PAGESIZE) or check the assumption below
-#if defined(GDRAPI_POWER) || defined(GDRAPI_ARM64)
-#define PAGE_SHIFT 16
-#else // catching all 4KB page size platforms here
-#define PAGE_SHIFT 12
-#endif
-#define PAGE_SIZE  (1UL << PAGE_SHIFT)
-#define PAGE_MASK  (~(PAGE_SIZE-1))
 
 // logging/tracing
 
@@ -114,12 +105,6 @@ gdr_t gdr_open()
     const char *gdrinode = "/dev/gdrdrv";
     int ret;
 
-    long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size != PAGE_SIZE) {
-        gdr_err("detected unexpected system page size\n");
-        return NULL;
-    }
-
     g = calloc(1, sizeof(*g));
     if (!g) {
         gdr_err("error while allocating memory\n");
@@ -165,6 +150,19 @@ gdr_t gdr_open()
     LIST_INIT(&g->memhs);
 
     gdr_init_cpu_flags();
+
+    // Initialize page_shift, page_size, and page_mask.
+    g->page_size = sysconf(_SC_PAGESIZE);
+    g->page_mask = ~(g->page_size - 1);
+
+    size_t ps_tmp = g->page_size;
+    g->page_shift = -1;
+    while (ps_tmp > 0) {
+        ++g->page_shift;
+        if (ps_tmp & 0x1 == 1)
+            break;
+        ps_tmp >>= 1;
+    }
 
     return g;
 
@@ -312,8 +310,8 @@ int gdr_map(gdr_t g, gdr_mh_t handle, void **ptr_va, size_t size)
         gdr_err("mh is mapped already\n");
         return EAGAIN;
     }
-    size_t rounded_size = (size + PAGE_SIZE - 1) & PAGE_MASK;
-    off_t magic_off = (off_t)mh->handle << PAGE_SHIFT;
+    size_t rounded_size = (size + g->page_size - 1) & g->page_mask;
+    off_t magic_off = (off_t)mh->handle << g->page_shift;
     void *mmio = mmap(NULL, rounded_size, PROT_READ|PROT_WRITE, MAP_SHARED, g->fd, magic_off);
     if (mmio == MAP_FAILED) {
         int __errno = errno;
@@ -332,8 +330,11 @@ int gdr_map(gdr_t g, gdr_mh_t handle, void **ptr_va, size_t size)
     }
     mh->mapped = info.mapped;
     if (!mh->mapped) {
-        gdr_err("mh should have been mapped at this point\n");
-        abort();
+        // Race could cause this issue.
+        // E.g., gdr_map and cuMemFree are triggered concurrently.
+        // The above mmap is successful but cuMemFree causes unmapping immediately.
+        gdr_err("mh is not mapped\n");
+        ret = EAGAIN;
     }
     mh->wc_mapping = info.wc_mapping;
     gdr_dbg("wc_mapping=%d\n", mh->wc_mapping);
@@ -345,8 +346,10 @@ int gdr_unmap(gdr_t g, gdr_mh_t handle, void *va, size_t size)
 {
     int ret = 0;
     int retcode = 0;
-    size_t rounded_size = (size + PAGE_SIZE - 1) & PAGE_MASK;
+    size_t rounded_size;
     gdr_memh_t *mh = to_memh(handle);
+
+    rounded_size = (size + g->page_size - 1) & g->page_mask;
 
     if (!mh->mapped) {
         gdr_err("mh is not mapped yet\n");

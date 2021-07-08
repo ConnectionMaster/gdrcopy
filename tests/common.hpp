@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2014-2021, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -73,6 +73,7 @@ START_TEST(__testname) {                                                \
             print_dbg("&&&& FAILED %s\n", gdrcopy::test::testname);     \
             ck_abort();                                                 \
         }                                                               \
+        __child_exit_status = WEXITSTATUS(__child_exit_status);         \
         if (__child_exit_status == EXIT_SUCCESS)                        \
             print_dbg("&&&& PASSED %s\n", gdrcopy::test::testname);     \
         else if (__child_exit_status == EXIT_WAIVED)                    \
@@ -113,11 +114,24 @@ START_TEST(__testname) {                                                \
 #define BEGIN_CHECK do
 #define END_CHECK while(0)
 
-
-
 namespace gdrcopy {
     namespace test {
-        extern std::map<CUdeviceptr, CUdeviceptr> _allocations;
+        typedef struct gpuMemHandle 
+        {
+            CUdeviceptr ptr; // aligned ptr if requested; otherwise, the same as unaligned_ptr.
+            union {
+                CUdeviceptr unaligned_ptr; // for tracking original ptr; may be unaligned.
+                #if CUDA_VERSION >= 11000
+                // VMM with GDR support is available from CUDA 11.0
+                CUmemGenericAllocationHandle handle;
+                #endif
+            };
+            size_t size;
+            size_t allocated_size;
+        } gpu_mem_handle_t;
+
+        typedef CUresult (*gpu_memalloc_fn_t)(gpu_mem_handle_t *handle, const size_t size, bool aligned_mapping, bool set_sync_memops);
+        typedef CUresult (*gpu_memfree_fn_t)(gpu_mem_handle_t *handle);
 
         static inline gdr_t gdr_open_safe()
         {
@@ -129,62 +143,16 @@ namespace gdrcopy {
             return g;
         }
 
-        static inline CUresult gpuMemAlloc(CUdeviceptr *pptr, size_t psize, bool align_to_gpu_page = true, bool set_sync_memops = true)
-        {
-            CUresult ret = CUDA_SUCCESS;
-            CUdeviceptr ptr;
-            size_t size;
-
-            if (align_to_gpu_page)
-                size = psize + GPU_PAGE_SIZE - 1;
-            else
-                size = psize;
-
-            ret = cuMemAlloc(&ptr, size);
-            if (ret != CUDA_SUCCESS)
-                return ret;
-
-            if (set_sync_memops) {
-                unsigned int flag = 1;
-                ret = cuPointerSetAttribute(&flag, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, ptr);
-                if (ret != CUDA_SUCCESS) {
-                    cuMemFree(ptr);
-                    return ret;
-                }
-            }
-
-            if (align_to_gpu_page)
-                *pptr = (ptr + GPU_PAGE_SIZE - 1) & GPU_PAGE_MASK;
-            else
-                *pptr = ptr;
-
-            // Record the actual pointer for doing gpuMemFree later.
-            _allocations[*pptr] = ptr;
-
-            return CUDA_SUCCESS;
-        }
-
-        static inline CUresult gpuMemFree(CUdeviceptr pptr)
-        {
-            CUresult ret = CUDA_SUCCESS;
-            CUdeviceptr ptr;
-
-            if (_allocations.count(pptr) > 0) {
-                ptr = _allocations[pptr];
-                ret = cuMemFree(ptr);
-                if (ret == CUDA_SUCCESS)
-                    _allocations.erase(ptr);
-                return ret;
-            }
-            else
-                return CUDA_ERROR_INVALID_VALUE;
-        }
-
         extern bool print_dbg_msg;
+        extern const char *testname;
 
         void print_dbg(const char* fmt, ...);
 
-        extern const char *testname;
+        CUresult gpu_mem_alloc(gpu_mem_handle_t *handle, const size_t size, bool aligned_mapping, bool set_sync_memops);
+        CUresult gpu_mem_free(gpu_mem_handle_t *handle);
+
+        CUresult gpu_vmm_alloc(gpu_mem_handle_t *handle, const size_t size, bool aligned_mapping, bool set_sync_memops);
+        CUresult gpu_vmm_free(gpu_mem_handle_t *handle);
 
         static inline bool operator==(const gdr_mh_t &a, const gdr_mh_t &b) {
             return a.h == b.h;
@@ -197,5 +165,9 @@ namespace gdrcopy {
         void init_hbuf_walking_bit(uint32_t *h_buf, size_t size);
 
         void init_hbuf_linear_ramp(uint32_t *h_buf, size_t size);
+
+        bool check_gdr_support(CUdevice dev);
+
+        void print_histogram(double *lat_arr, int count, int *bin_arr, int num_bins, double min, double max);
     }
 }
